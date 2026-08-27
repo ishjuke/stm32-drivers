@@ -19,6 +19,7 @@ right.
 | 2 | Register-level GPIO blink (PA5) | Register decomposition in GDB; timing measured on a logic analyzer |
 | 3 | UART TX on USART2 (PA2, AF7) | Disassembly of the flashed ELF + protocol decode off the physical wire |
 | 4 | Interrupt-driven UART RX with a ring buffer | Three scripted tests with predicted vs. measured byte counts |
+| 5 | I2C driver for a BME280 sensor, with compensation | Chip ID readback, physical stimulus response, cross-check against a local weather station |
 
 ---
 
@@ -248,9 +249,165 @@ indices, exactly — nothing unaccounted for.
 
 ---
 
+## Milestone 5 — I2C and a real sensor
+
+The first peripheral with a slave on the other end. UART transmits into the
+void and doesn't care whether anything is listening; I2C is a handshake, and
+every step can fail in a way the peripheral reports only as "still waiting."
+
+**Configuration.** PB8 (SCL) and PB9 (SDA) as AF4 for I2C1, and — new versus
+every previous milestone — **open-drain** output via `OTYPER`. I2C is a
+wired-AND bus where devices pull low and pull-ups restore high; a push-pull
+driver would fight the pull-ups and could damage something. `CR2` FREQ is set
+to the APB1 clock in MHz (16), then `CCR = 16e6 / (2 × 100e3) = 80` and
+`TRISE = (1000ns / 62.5ns) + 1 = 17` for 100 kHz standard mode. `PE` is
+enabled last, because `CCR` and `TRISE` are write-protected while the
+peripheral is running.
+
+**Reads.** Register access is a compound transaction: address the device for
+write, send the register pointer, issue a repeated START, re-address for read,
+then receive. Single-byte and multi-byte reads have genuinely different
+teardowns — for one byte, ACK is disabled and STOP issued around a single
+transfer; for N bytes, ACK stays on until the second-to-last byte arrives.
+RM0368 §18.3.3 treats them as separate cases and they are.
+
+**No bare spin loops.** Every flag wait is wrapped in a helper that takes a
+timeout and a label:
+
+```c
+if (!i2c1_wait(I2C_SR1_ADDR, "ADDR")) { /* reports which flag never came */ }
+```
+
+An infinite `while (!(SR1 & FLAG))` tells you nothing when it hangs. A timeout
+that names the stalled flag localizes the failure before you've attached a
+debugger — which is what made both of the bugs below tractable.
+
+### Bug 1 — STOP before ADDR clear
+
+**Symptom:** the chip-ID read hung at the final receive. No error flags: SR1
+was `0x0000`, so no NACK, no bus error, no arbitration loss. SR2 read `0x0003`
+(MSL and BUSY set, TRA clear — still master, still mid-transaction, correctly
+in receive direction). CR1 read `0x0201`: PE set, ACK correctly cleared, and
+**STOP still pending**, never self-clearing.
+
+**Reasoning:** the address phase had ACKed twice — once for write, once after
+the repeated START. An ACK is the slave physically pulling SDA low on the ninth
+clock, which a disconnected wire, dead sensor, or wrong address cannot fake.
+That ruled out the entire hardware hypothesis without touching the bench. A
+stuck STOP with no error latched pointed instead at a sequencing violation.
+
+**Cause:** STOP was being programmed before the ADDR flag was cleared.
+RM0368 §18.3.3 puts ACK-disable at EV6 *before* the ADDR clear, and STOP
+*after*. Requesting a stop while the peripheral was still waiting on the
+address condition wedged the state machine with no error path to report it.
+
+**Fix:** swap the two steps. Correct on the first reflash — chip ID `0x60`,
+confirming a genuine BME280 rather than the BMP280 that ships in a
+depressing share of listings.
+
+Diagnosed entirely from CR1/SR1/SR2 state. No logic analyzer capture was
+needed, which is worth noting after the milestone-3 debugging session went
+the opposite way.
+
+### Bug 2 — a predicate true on both sides of the event
+
+**Symptom:** the first burst read returned the reset-default register pattern,
+which happens to coincide with the datasheet's "measurement skipped" sentinel.
+The second read looked correct. Same code, different result.
+
+**Cause:** `bme280_wait_measurement()` polled for `measuring == 0`. That
+predicate is satisfied *both* before a conversion starts and after it
+finishes — the poll won the race and returned instantly, so the burst grabbed
+registers that had never been written.
+
+The second read only worked by accident: two unrelated register-readback
+`printf`s happened to delay the poll long enough for the conversion to begin.
+Remove those debug prints and the bug returns. That is the worst shape a bug
+can have — correctness contingent on unrelated timing.
+
+**Fix:** wait for the 0→1 edge (conversion genuinely started), *then* the 1→0
+edge (genuinely finished). Deterministic regardless of how fast the caller
+arrives. Level-checking a flag that is asserted only transiently is never
+sufficient; the edge is the event.
+
+Verified across three consecutive resets, all returning distinct values with
+`up` and `ut` climbing monotonically from board self-heating and `uh` moving
+in a smaller, uncorrelated range. Coupling to a physical process is evidence
+a stuck register cannot produce.
+
+### Compensation
+
+Calibration coefficients live in two non-contiguous blocks (0x88–0xA1 and
+0xE1–0xE7) and are a mix of signed and unsigned 16-bit values, with `dig_H4`
+and `dig_H5` bit-packed into a shared byte at 0xE5. Getting a signedness wrong
+produces output that still looks plausible — the worst failure mode, since
+nothing crashes and nothing is obviously out of range.
+
+The compensation routines are ported **verbatim** from datasheet §4.2.3 —
+same variable names, same shift amounts, same operation order — deliberately.
+This is exactly the class of fixed-point arithmetic where a tidier rewrite
+would look correct and be silently wrong.
+
+`t_fine` is computed as a side effect of temperature compensation and consumed
+by both pressure and humidity, so temperature must run first. The ordering is
+load-bearing, not stylistic.
+
+### Toolchain: the 64-bit divide
+
+The pressure path needs a 64-bit division, which Cortex-M4 has no instruction
+for. GCC emits a call to `__aeabi_ldivmod`, and the link failed:
+
+```
+undefined reference to `__aeabi_ldivmod'
+```
+
+`-nostdlib` excludes libgcc along with libc. But libgcc is not the C standard
+library — it's the compiler's own runtime for operations the ISA can't perform
+natively, the same category as the compiler deciding which instructions to
+emit. Linking it doesn't compromise the no-HAL, no-vendor-library constraint.
+
+Adding `-lgcc` to `LDFLAGS` did not fix it. The linker processes archives left
+to right and pulls only members that resolve symbols it has *already* seen
+unresolved; with `-lgcc` ahead of the object files, nothing needed
+`__aeabi_ldivmod` yet, so the archive was scanned and discarded before the
+reference existed. It has to come **after** the objects on the link line.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Chip ID (0xD0) | `0x60` — genuine BME280 |
+| Steady-state output | 30.14 °C / 97523 Pa / 38.48 %RH |
+| Reset-to-reset stability | Values drift plausibly; nothing pinned |
+| Temperature vs. phone | 30.1 °C measured vs. 29 °C reported — the ~1 °C offset is the expected direction for a sensor beside a powered MCU |
+| Humidity step response | 49% baseline → 78.83% peak on breath → decay back to ~49% over ~13 s |
+| Pressure vs. weather station | See below |
+
+The humidity step response is the strongest single piece of evidence here. A
+spike followed by exponential decay back to the original baseline is a shape
+no stuck register, sentinel value, or scale error can produce. It exercises
+the full path — bus, burst read, compensation math — against a known physical
+stimulus.
+
+**Pressure cross-check.** Region of Waterloo International Airport reported
+101.3 kPa (sea-level corrected). Kitchener sits at roughly 336 m, and the
+station-pressure correction is about 12 Pa/m, so the expected reading at this
+elevation is roughly 101.3 − 4.0 = **97.3 kPa**. Measured: **97.52 kPa**. A
+~0.2 kPa gap against a linear approximation of a relationship that is actually
+exponential and temperature-dependent, with the elevation known only
+approximately.
+
+An earlier version of this check compared against Kingston's ~90 m elevation
+and appeared to show a 3 kPa error. The measurement was correct; the reference
+point was wrong. Worth recording, because "the reading disagrees with
+expectation" and "the reading is wrong" are not the same claim, and the
+cheaper thing to check is usually the expectation.
+
+---
+
 ## Verification approach
 
-The through-line across all four milestones: a correct-looking output is not evidence
+The through-line across all five milestones: a correct-looking output is not evidence
 that the mechanism producing it is correct.
 
 - Confirming a value is right doesn't prove your code set it — **disable the code and
@@ -261,6 +418,8 @@ that the mechanism producing it is correct.
   **decode the signal.**
 - Confirming a buffer has a limit doesn't prove your overflow policy — **check which data
   survived.**
+- Confirming a value is plausible doesn't prove the pipeline works — **drive the input
+  and confirm the output follows.**
 
 Each of those caught something, or would have if it had been wrong.
 
@@ -273,3 +432,9 @@ Each of those caught something, or would have if it had been wrong.
 - `bss_test == 0` proves the zero loop ran. *(SRAM could already have been zero.)*
 - CN3's TX pin carries the target's transmit. *(Labels are from the ST-LINK's
   perspective.)*
+- A stalled bus means bad wiring. *(The slave had ACKed twice — it was a
+  sequencing bug in my own code.)*
+- Waiting for `measuring == 0` means waiting for the measurement.
+  *(It's also true before the measurement starts.)*
+- The sensor disagreed with expected pressure, so the compensation math is
+  wrong. *(Wrong city's elevation.)*
