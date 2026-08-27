@@ -1,6 +1,9 @@
 #include <stdint.h>
 
 #define RCC_BASE     0x40023800UL
+#define RCC_CR       (*(volatile uint32_t *)(RCC_BASE + 0x00))
+#define RCC_PLLCFGR  (*(volatile uint32_t *)(RCC_BASE + 0x04))
+#define RCC_CFGR     (*(volatile uint32_t *)(RCC_BASE + 0x08))
 #define RCC_AHB1ENR  (*(volatile uint32_t *)(RCC_BASE + 0x30))
 #define RCC_APB1ENR  (*(volatile uint32_t *)(RCC_BASE + 0x40))
 
@@ -89,6 +92,49 @@
 #define NVIC_ISER1      (*(volatile uint32_t *)0xE000E104UL)
 #define USART2_IRQn_BIT (1U << 6)
 
+/* Clock tree: HSI (16 MHz) through the main PLL to 84 MHz SYSCLK, this
+ * part's maximum (RM0368 6.3.1/6.3.2/6.3.3). Bit positions/values below
+ * are all cross-checked against RM0368 Rev 4 directly, not recalled --
+ * getting the flash latency or VCO range wrong here is a hard fault,
+ * not a wrong number. */
+#define RCC_CR_PLLON  (1U << 24)
+#define RCC_CR_PLLRDY (1U << 25)
+
+/* RCC_PLLCFGR (RM0368 6.3.2): PLLM/PLLN/PLLQ take their divisor/
+ * multiplier value directly; PLLP is 2 bits encoding {2,4,6,8} as
+ * {00,01,10,11}. PLLSRC (bit 22) is left at its reset value of 0 (HSI)
+ * -- this board has never had HSE configured. */
+#define RCC_PLLCFGR_PLLM_POS 0
+#define RCC_PLLCFGR_PLLN_POS 6
+#define RCC_PLLCFGR_PLLP_POS 16
+#define RCC_PLLCFGR_PLLQ_POS 24
+
+#define RCC_CFGR_SW_MASK     (0x3U)
+#define RCC_CFGR_SW_PLL      (0x2U)
+#define RCC_CFGR_SWS_MASK    (0x3U << 2)
+#define RCC_CFGR_SWS_PLL     (0x2U << 2)
+#define RCC_CFGR_PPRE1_MASK  (0x7U << 10)
+#define RCC_CFGR_PPRE1_DIV2  (0x4U << 10)
+
+#define RCC_APB1ENR_PWREN (1U << 28)
+
+/* PWR: RM0368 5.5, base from the memory map (5.5, "0x4000 7000 -
+ * 0x4000 73FF PWR"). Needed only for the voltage-scaling write in
+ * clock_init() -- its clock has to be enabled first via
+ * RCC_APB1ENR_PWREN, same precondition as any other APB1 peripheral in
+ * this file. */
+#define PWR_BASE 0x40007000UL
+#define PWR_CR   (*(volatile uint32_t *)(PWR_BASE + 0x00))
+#define PWR_CR_VOS        (0x3U << 14)
+#define PWR_CR_VOS_SCALE2 (0x2U << 14)  /* RM0368 3.4.1: VOS[1:0]=10 -> max fHCLK = 84 MHz */
+
+/* Flash: RM0368 3.8, base from the memory map (3.8, "0x4002 3C00 -
+ * 0x4002 3FFF"). */
+#define FLASH_BASE 0x40023C00UL
+#define FLASH_ACR  (*(volatile uint32_t *)(FLASH_BASE + 0x00))
+#define FLASH_ACR_LATENCY     (0xFU)
+#define FLASH_ACR_LATENCY_2WS (0x2U)  /* RM0368 Table 6: 2 WS for 60 < HCLK <= 84 MHz at 2.7-3.6 V */
+
 /* SysTick: PM0214 4.5. Part of the Cortex-M4 core (System Control
  * Space), not a peripheral behind an RCC clock-enable bit. */
 #define SYSTICK_BASE 0xE000E010UL
@@ -100,19 +146,21 @@
 #define SYST_CSR_TICKINT   (1U << 1)
 #define SYST_CSR_CLKSOURCE (1U << 2)  /* 1 = core clock, 0 = core clock / 8 */
 
-/* fCK = 16 MHz HSI, no PLL configured -- same assumption USART2_BRR and
- * I2C1_CR2/CCR/TRISE already make elsewhere in this file. CLKSOURCE is
- * set below (core clock, not /8): the reload value is derived directly
- * from SYSTICK_HZ, so if a later clock-tree milestone changes SYSCLK
- * (e.g. enables the PLL), CLKSOURCE and SYSTICK_HZ both need
- * revisiting together, not just one of them. */
-#define SYSTICK_HZ 16000000UL
+/* fCK = 84 MHz post-clock_init() (the clock-tree extension: HSI through
+ * the PLL, up from the milestone-6 16 MHz HSI-direct baseline).
+ * CLKSOURCE is set below (core clock, not /8), so the reload value is
+ * derived directly from SYSTICK_HZ -- the two have to change together,
+ * which is exactly what happened here. */
+#define SYSTICK_HZ 84000000UL
 
-/* The counter reloads on the tick after it hits zero, so a period of N
- * cycles needs N-1 loaded, not N. Getting this wrong doesn't fail
- * loudly -- it just makes the clock 1 cycle per period fast (loading
- * 16000 instead of 15999 here would make every "1 ms" tick 0.006%
- * short: invisible in testing, wrong forever). */
+/* The counter reloads on the tick after it hits zero: reload value N
+ * gives an actual period of N+1 cycles (ARM's documented behavior), so
+ * a period of P cycles needs P-1 loaded, not P. Getting this wrong
+ * doesn't fail loudly -- it just skews the clock by 1 cycle per period.
+ * The intuitive mistake is forgetting the -1 (loading 84000 instead of
+ * 83999): that makes the *period* longer, not shorter, so every "1 ms"
+ * tick actually takes ~0.001% longer than 1 ms, and the clock runs
+ * slow, not fast -- invisible in testing, wrong forever. */
 #define SYSTICK_RELOAD_1MS (SYSTICK_HZ / 1000UL - 1UL)
 
 #define RB_SIZE 64   /* power of two on purpose: (head+1) & (RB_SIZE-1) replaces a modulo */
@@ -170,6 +218,66 @@ void USART2_IRQHandler(void)
          * keeps already-buffered, not-yet-echoed bytes intact and in
          * order rather than corrupting them. */
     }
+}
+
+/* Raises SYSCLK from the 16 MHz HSI reset default to 84 MHz (this
+ * part's maximum) through the main PLL. Must run before anything that
+ * derives a divisor from the clock -- SysTick's reload below, and
+ * USART2/I2C1's BRR/CCR/TRISE in main() -- so it's the first thing
+ * main() calls. Follows RM0368 3.4.1's "increasing the CPU frequency"
+ * procedure: raise flash latency first, then switch. */
+static void clock_init(void)
+{
+    /* 2 WS: RM0368 Table 6, 60 < HCLK <= 84 MHz at 2.7-3.6 V (this
+     * board measures 3.25 V). Getting this wrong doesn't slow the chip
+     * down -- flash can't supply instructions fast enough and the CPU
+     * runs off into garbage, an immediate hard fault. */
+    FLASH_ACR = (FLASH_ACR & ~FLASH_ACR_LATENCY) | FLASH_ACR_LATENCY_2WS;
+
+    /* PWR_CR needs its own APB1 clock enabled before it's writable
+     * (RM0368 5.1.3), the same precondition as any other APB1
+     * peripheral in this file. VOS already resets to Scale 2 -- which
+     * RM0368 3.4.1 lists as good for up to 84 MHz, exactly what's
+     * needed here -- so this write is redundant with the reset state,
+     * but it's written explicitly rather than relied on implicitly.
+     * (Scale 1 doesn't exist on this part; the only other option,
+     * Scale 3, tops out at 60 MHz. Per RM0368 5.1.3 the regulator is
+     * forced to Scale 3 regardless of VOS whenever the PLL is off, so
+     * this value only actually takes effect once PLLON is set below --
+     * no VOSRDY poll needed here since the value never actually
+     * transitions.) */
+    RCC_APB1ENR |= RCC_APB1ENR_PWREN;
+    (void)RCC_APB1ENR;
+    PWR_CR = (PWR_CR & ~PWR_CR_VOS) | PWR_CR_VOS_SCALE2;
+
+    /* PLLM=8: VCO input = 16 MHz / 8 = 2 MHz, the recommended value
+     * (RM0368 6.3.2: "select 2 MHz to limit PLL jitter"; valid range is
+     * 1-2 MHz).
+     * PLLN=168: VCO output = 2 MHz * 168 = 336 MHz (must land in
+     * 192-432 MHz, RM0368 6.3.2).
+     * PLLP=/4 (encoded 0b01 below): SYSCLK = 336 / 4 = 84 MHz.
+     * PLLQ=7: 336 / 7 = 48 MHz -- unused (no USB/SDIO/RNG wired up
+     * yet), but set to a real, valid value rather than left at a
+     * "wrong configuration" encoding.
+     * All of these, plus PLLSRC, can only be written while the PLL is
+     * off -- true here, since it's still off from reset. */
+    RCC_PLLCFGR = (8UL   << RCC_PLLCFGR_PLLM_POS)
+                | (168UL << RCC_PLLCFGR_PLLN_POS)
+                | (0x1UL << RCC_PLLCFGR_PLLP_POS)   /* 0b01 = /4 */
+                | (7UL   << RCC_PLLCFGR_PLLQ_POS);  /* PLLSRC left at 0 = HSI */
+
+    RCC_CR |= RCC_CR_PLLON;
+    while (!(RCC_CR & RCC_CR_PLLRDY)) { }
+
+    /* APB1 maxes out at 42 MHz (RM0368 6.2), so it needs /2 from an
+     * 84 MHz HCLK; APB2 and AHB both max out at 84 MHz, so HPRE and
+     * PPRE2 stay at their reset default of /1 -- untouched below.
+     * PPRE1 and SW are set in the same write so APB1 is already
+     * dividing by 2 in the same bus cycle SYSCLK becomes 84 MHz -- no
+     * window where APB1 briefly sees undivided 84 MHz. */
+    RCC_CFGR = (RCC_CFGR & ~(RCC_CFGR_PPRE1_MASK | RCC_CFGR_SW_MASK))
+             | RCC_CFGR_PPRE1_DIV2 | RCC_CFGR_SW_PLL;
+    while ((RCC_CFGR & RCC_CFGR_SWS_MASK) != RCC_CFGR_SWS_PLL) { }
 }
 
 /* Written only here (interrupt context), read only in main -- volatile
@@ -293,14 +401,15 @@ static void i2c1_init(void)
      * go; the external pull-ups on the breakout board do the rest. */
     GPIOB_OTYPER |= (1U << 8) | (1U << 9);
 
-    /* fPCLK1 = 16 MHz HSI, APB1 /1 at reset -> CR2.FREQ = 16.
-     * Standard mode 100 kHz: CCR = fPCLK1 / (2 * 100 kHz) = 80.
-     * TRISE = fPCLK1[MHz] + 1 = 17 (1000 ns max Sm rise time / 62.5 ns
-     * period). CR2/CCR/TRISE must be written while PE = 0, so PE goes
-     * last. */
-    I2C1_CR2   = 16U;
-    I2C1_CCR   = 80U;
-    I2C1_TRISE = 17U;
+    /* fPCLK1 = 42 MHz post-clock_init() (SYSCLK/2; was 16 MHz HSI
+     * before the clock-tree extension) -> CR2.FREQ = 42.
+     * Standard mode 100 kHz: CCR = fPCLK1 / (2 * 100 kHz) = 210.
+     * TRISE = fPCLK1[MHz] + 1 = 43 (1000 ns max Sm rise time / 23.8 ns
+     * period at 42 MHz). CR2/CCR/TRISE must be written while PE = 0, so
+     * PE goes last. */
+    I2C1_CR2   = 42U;
+    I2C1_CCR   = 210U;
+    I2C1_TRISE = 43U;
 
     I2C1_CR1 = I2C_CR1_PE;
 }
@@ -641,6 +750,7 @@ static void bme280_sample_and_print(void)
 
 int main(void)
 {
+    clock_init();
     systick_init();
 
     RCC_AHB1ENR |= (1 << 0);   /* GPIOAEN */
@@ -666,11 +776,17 @@ int main(void)
     GPIOA_MODER |=  (0x1 << (LD2_PIN * 2));
 
     /*
-     * fCK = 16 MHz (HSI, APB1 prescaler /1 at reset).
-     * USARTDIV = 16e6 / (16 * 115200) = 8.6806
-     * mantissa = 8, fraction = round(0.6806 * 16) = 11 (0xB)
+     * fCK = 42 MHz post-clock_init() (PCLK1 = SYSCLK/2; was 16 MHz HSI
+     * before the clock-tree extension).
+     * USARTDIV = 42e6 / (16 * 115200) = 22.7865 (exact division, not a
+     * clean fraction). Nearest 1/16 step: mantissa = 22, fraction =
+     * round(0.7865 * 16) = 13 (0xD) -- giving a programmed USARTDIV of
+     * 22 + 13/16 = 22.8125. That post-rounding value is what RM0368's
+     * own Table 82 entry for 115.2 KBps at fPCLK=42 MHz lists (115.068
+     * KBps actual, 0.11% error) -- it's the register's contents, not
+     * the raw division result.
      */
-    USART2_BRR = (8 << 4) | 0xB;
+    USART2_BRR = (22 << 4) | 0xD;
 
     USART2_CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
 
