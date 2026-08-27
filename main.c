@@ -76,20 +76,44 @@
 #define I2C_TIMEOUT_ITERS 100000UL
 #define BME280_STATUS_POLL_TRIES 200UL
 
-/* No SysTick configured yet, so this just counts idle main-loop passes
- * between samples -- same uncalibrated busy-wait idiom as the
- * milestone-2 LED blink, not a real timer. Measured empirically at
- * ~1.62 us/iteration in this loop (slower than milestone-2's plain
- * delay, since this one also polls the volatile ring-buffer indices
- * every pass); tuned for roughly 1.5-2 s between samples, which is what
- * the breath test needs to resolve a spike-and-decay curve instead of a
+/* Milestone 5 timed this by counting busy-wait loop iterations -- an
+ * empirically-tuned ~1.62 us/iteration, not a real timer. SysTick now
+ * gives a genuine millisecond tick, so this is a real period: 1.5 s,
+ * the same target window the empirical tuning was aiming for so the
+ * breath test still resolves a spike-and-decay curve instead of a
  * couple of blurred points. */
-#define BME280_SAMPLE_PERIOD_ITERS 1000000UL
+#define BME280_SAMPLE_PERIOD_MS 1500UL
 
 /* NVIC: IRQ38 (USART2, confirmed against ST's CMSIS stm32f401xe.h) falls
  * in ISER1, which covers IRQ32..63. Bit position = 38 - 32 = 6. */
 #define NVIC_ISER1      (*(volatile uint32_t *)0xE000E104UL)
 #define USART2_IRQn_BIT (1U << 6)
+
+/* SysTick: PM0214 4.5. Part of the Cortex-M4 core (System Control
+ * Space), not a peripheral behind an RCC clock-enable bit. */
+#define SYSTICK_BASE 0xE000E010UL
+#define SYST_CSR (*(volatile uint32_t *)(SYSTICK_BASE + 0x00))
+#define SYST_RVR (*(volatile uint32_t *)(SYSTICK_BASE + 0x04))
+#define SYST_CVR (*(volatile uint32_t *)(SYSTICK_BASE + 0x08))
+
+#define SYST_CSR_ENABLE    (1U << 0)
+#define SYST_CSR_TICKINT   (1U << 1)
+#define SYST_CSR_CLKSOURCE (1U << 2)  /* 1 = core clock, 0 = core clock / 8 */
+
+/* fCK = 16 MHz HSI, no PLL configured -- same assumption USART2_BRR and
+ * I2C1_CR2/CCR/TRISE already make elsewhere in this file. CLKSOURCE is
+ * set below (core clock, not /8): the reload value is derived directly
+ * from SYSTICK_HZ, so if a later clock-tree milestone changes SYSCLK
+ * (e.g. enables the PLL), CLKSOURCE and SYSTICK_HZ both need
+ * revisiting together, not just one of them. */
+#define SYSTICK_HZ 16000000UL
+
+/* The counter reloads on the tick after it hits zero, so a period of N
+ * cycles needs N-1 loaded, not N. Getting this wrong doesn't fail
+ * loudly -- it just makes the clock 1 cycle per period fast (loading
+ * 16000 instead of 15999 here would make every "1 ms" tick 0.006%
+ * short: invisible in testing, wrong forever). */
+#define SYSTICK_RELOAD_1MS (SYSTICK_HZ / 1000UL - 1UL)
 
 #define RB_SIZE 64   /* power of two on purpose: (head+1) & (RB_SIZE-1) replaces a modulo */
 static volatile uint8_t  rb[RB_SIZE];
@@ -146,6 +170,40 @@ void USART2_IRQHandler(void)
          * keeps already-buffered, not-yet-echoed bytes intact and in
          * order rather than corrupting them. */
     }
+}
+
+/* Written only here (interrupt context), read only in main -- volatile
+ * for the same reason as the ring buffer's head/tail: it stops the
+ * compiler from caching a stale value in a register across loop
+ * iterations, not because the read/write itself needs to be atomic. */
+static volatile uint32_t ticks;
+
+void SysTick_Handler(void)
+{
+    ticks++;
+}
+
+static void systick_init(void)
+{
+    SYST_RVR = SYSTICK_RELOAD_1MS;
+    SYST_CVR = 0;   /* writing any value clears CVR and COUNTFLAG -- start from a known state, not whatever reset left behind */
+    SYST_CSR = SYST_CSR_CLKSOURCE | SYST_CSR_TICKINT | SYST_CSR_ENABLE;
+}
+
+static uint32_t millis(void)
+{
+    return ticks;
+}
+
+/* ticks wraps every ~49.7 days at 1 ms/tick (2^32 ms). Unsigned
+ * subtraction wraps the same way ticks does, so (now - start) stays
+ * correct across that rollover for any ms up to ~2^31; `now >= start +
+ * ms` is not -- start + ms can itself silently wrap and compare wrong
+ * right at the boundary. */
+static void delay_ms(uint32_t ms)
+{
+    uint32_t start = millis();
+    while ((uint32_t)(millis() - start) < ms) { }
 }
 
 static void uart_putc(uint8_t c)
@@ -583,6 +641,8 @@ static void bme280_sample_and_print(void)
 
 int main(void)
 {
+    systick_init();
+
     RCC_AHB1ENR |= (1 << 0);   /* GPIOAEN */
     (void)RCC_AHB1ENR;
 
@@ -656,7 +716,7 @@ int main(void)
     }
 
     uint8_t led_state = 0;
-    uint32_t sample_countdown = BME280_SAMPLE_PERIOD_ITERS;
+    uint32_t last_sample = millis();
 
     while (1) {
         if (tail != head) {
@@ -673,18 +733,17 @@ int main(void)
             led_state = !led_state;
         }
 
-        /* Countdown lives in the same loop as the RX echo above (rather
-         * than a nested busy_delay call) so a long gap between samples
+        /* Checked in the same loop as the RX echo above (rather than a
+         * blocking delay_ms() call) so a long gap between samples
          * doesn't stall echoing bytes that arrived during it -- the ring
          * buffer would hold them either way, but this keeps the terminal
-         * responsive instead of bursty. */
-        if (ok) {
-            if (sample_countdown == 0) {
-                bme280_sample_and_print();
-                sample_countdown = BME280_SAMPLE_PERIOD_ITERS;
-            } else {
-                sample_countdown--;
-            }
+         * responsive instead of bursty. Same unsigned-subtraction
+         * wraparound safety as delay_ms(): correct across the ~49-day
+         * ticks rollover, where `millis() >= last_sample + PERIOD` would
+         * not be. */
+        if (ok && (uint32_t)(millis() - last_sample) >= BME280_SAMPLE_PERIOD_MS) {
+            bme280_sample_and_print();
+            last_sample = millis();
         }
     }
 }
