@@ -280,6 +280,29 @@ static void clock_init(void)
     while ((RCC_CFGR & RCC_CFGR_SWS_MASK) != RCC_CFGR_SWS_PLL) { }
 }
 
+/* Post-bring-up verification (logic analyzer, PA5/PB8/CN3-RX): SysTick,
+ * I2C1's SCL, and USART2's TX all measured ~1.1-1.6% fast against their
+ * nominal periods -- up from the ~0.455% measured on SysTick alone
+ * before this file switched SYSCLK onto the PLL, at 16 MHz. PCLK1 and
+ * HCLK are exact integer divisions of the same SYSCLK (confirmed in
+ * the disassembly), so they can't genuinely carry different trim error
+ * at a single instant -- the consistent shift across all three is
+ * upstream of any one peripheral, not three separate bugs.
+ *
+ * Beyond that, this is *consistent with* self-heating on the HSI (an
+ * on-die RC oscillator, not a crystal) now that the core draws more
+ * power at 84 MHz than at 16 MHz -- but that is not independently
+ * confirmed. The distinguishing test is a capture immediately after a
+ * cold power-on versus one after ~10 minutes running: growing drift
+ * would mean thermal, constant drift from the first second would point
+ * at something else (PLL jitter, or the logic analyzer's own
+ * uncharacterized timebase -- a cheap crystal never itself measured
+ * against a reference). That test hasn't been run. Also unexplained:
+ * 1.1-1.6% sits outside the HSI's own +/-1% factory-trim spec, so an
+ * out-of-spec part is a third live possibility alongside thermal drift
+ * and instrument error. Worth resolving before leaning on this clock
+ * for anything timing-sensitive enough to care. */
+
 /* Written only here (interrupt context), read only in main -- volatile
  * for the same reason as the ring buffer's head/tail: it stops the
  * compiler from caching a stale value in a register across loop
