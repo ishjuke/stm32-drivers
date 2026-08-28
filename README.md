@@ -2,7 +2,7 @@
 
 A bare-metal driver stack for the STM32F401RE (ARM Cortex-M4), written in C with no
 HAL, no CubeMX-generated code, and no vendor libraries. Every register write is derived
-from RM0368 and the F401xE datasheet.
+from RM0368, the F401xE datasheet, and — for the core peripherals — PM0214.
 
 The point wasn't to make an LED blink. It was to build the layer underneath the layer
 most embedded projects start from — the linker script, the vector table, the C runtime —
@@ -20,12 +20,16 @@ right.
 | 3 | UART TX on USART2 (PA2, AF7) | Disassembly of the flashed ELF + protocol decode off the physical wire |
 | 4 | Interrupt-driven UART RX with a ring buffer | Three scripted tests with predicted vs. measured byte counts |
 | 5 | I2C driver for a BME280 sensor, with compensation | Chip ID readback, physical stimulus response, cross-check against a local weather station |
+| 6 | SysTick millisecond timebase | Tick period measured on a logic analyzer; rollover arithmetic reasoned through |
+| 7 | Clock tree — HSI through the PLL to 84 MHz | Every clock-derived constant re-measured on hardware, not recompiled and assumed |
+| 8 | DMA-driven UART TX (DMA1 stream 6, channel 4) | Bit-for-bit waveform comparison against the polled path, decoded off the wire |
 
 ---
 
 ## Hardware and toolchain
 
-- **Board:** NUCLEO-F401RE (MB1136 rev C), STM32F401RET6, Cortex-M4 @ 16 MHz HSI
+- **Board:** NUCLEO-F401RE (MB1136 rev C), STM32F401RET6, Cortex-M4 — 16 MHz HSI at
+  reset, clocked to its 84 MHz maximum through the PLL in milestone 7
 - **Host:** Raspberry Pi 5 over SSH — build, flash, and debug all run on the Pi with the
   Nucleo attached by USB
 - **Toolchain:** `arm-none-eabi-gcc`, `arm-none-eabi-objcopy`, OpenOCD, `gdb-multiarch`,
@@ -275,7 +279,7 @@ RM0368 §18.3.3 treats them as separate cases and they are.
 timeout and a label:
 
 ```c
-if (!i2c1_wait(I2C_SR1_ADDR, "ADDR")) { /* reports which flag never came */ }
+if (i2c1_wait(I2C_SR1_ADDR, "ADDR (read)") < 0) return -1;  /* helper has already named the stalled flag */
 ```
 
 An infinite `while (!(SR1 & FLAG))` tells you nothing when it hangs. A timeout
@@ -405,9 +409,241 @@ cheaper thing to check is usually the expectation.
 
 ---
 
+## Milestone 6 — a real timebase
+
+Milestone 5 timed the BME280 sample period by counting main-loop iterations — an
+uncalibrated proxy (~1.62 µs per pass, heavier than milestone 2's bare `delay()` loop
+because this one also reads the volatile ring-buffer indices every time), tuned until
+the gap between samples sat near the 1.5 s that keeps the humidity breath-test
+resolving as a curve rather than two blurred points. SysTick replaces it with an
+actual clock.
+
+**Configuration.** SysTick is part of the Cortex-M4 core (System Control Space,
+PM0214 §4.5), not a peripheral — there is no `RCC` clock-enable bit, it is always
+powered. `SYST_CSR` / `SYST_RVR` / `SYST_CVR` at `0xE000E010`. `CLKSOURCE` is set to
+the core clock (not core / 8), `TICKINT` for the interrupt, `ENABLE` to start.
+
+**The reload value.** The counter reloads the cycle *after* it reaches zero, so a
+period of N cycles needs N − 1 loaded. At 16 MHz, 1 ms is 16000 cycles → `RVR = 15999`.
+Getting the − 1 wrong doesn't fail loudly: load 16000 and every "1 ms" tick is one
+cycle too long, the clock runs slow by ~0.006%, invisible in testing and wrong
+forever. Writing any value to `SYST_CVR` clears it and `COUNTFLAG` — start from a
+known state rather than whatever reset left behind.
+
+**The counter.** `SysTick_Handler` increments a `volatile uint32_t ticks`; `millis()`
+reads it. Same `volatile`-for-the-compiler-not-the-hardware reasoning as milestone 4's
+ring-buffer indices — it stops `ticks` being cached in a register across a poll loop,
+nothing more.
+
+**Rollover.** `ticks` wraps every ~49.7 days (2³² ms). `delay_ms()` spins on
+`(uint32_t)(millis() - start) < ms`: unsigned subtraction wraps the same way `ticks`
+does, so `(now - start)` stays correct across the rollover for any interval up to
+~2³¹ ms. The intuitive `now >= start + ms` is **not** safe — `start + ms` can itself
+wrap and break the comparison at the boundary. The main loop's sample scheduling uses
+the same `(now - last)` form, checked non-blocking alongside the RX echo so a slow
+sample never stalls byte echo.
+
+**Verification.** Temporarily toggle PA5 in `SysTick_Handler` and capture on the
+analyzer (reverted afterward — it is a diagnostic, not a feature): **995.45 µs**
+average tick against 1000 µs nominal, ~0.455% fast, inside the HSI's ±1% factory-trim
+spec. The retired busy-wait couldn't be checked this way at all — there was no edge
+to measure, only a loop count someone had tuned by eye.
+
+---
+
+## Milestone 7 — the clock tree
+
+Everything so far ran on the 16 MHz HSI because that is the reset default and nothing
+needed more. Reaching the part's 84 MHz maximum means the PLL — and by now three
+separate constants derive from the clock and every one has to be rederived.
+
+**Order.** RM0368 §3.4.1's "increasing the CPU frequency" procedure: raise the flash
+wait states *first*, then switch SYSCLK. The other way round, the core is fetching
+from flash that can't keep up before the latency catches it.
+
+**Flash.** 2 wait states (`FLASH_ACR.LATENCY`), RM0368 Table 6, for 60 < HCLK ≤ 84 MHz
+at 2.7–3.6 V (the board measures ~3.25 V). Wrong here is an immediate hard fault —
+flash physically can't supply instructions fast enough and the core runs off into
+garbage — not a graceful slowdown.
+
+**PLL** (`RCC_PLLCFGR`). `PLLM = 8` → 16 / 8 = 2 MHz at the VCO input (§6.3.2: "select
+2 MHz to limit PLL jitter"). `PLLN = 168` → 2 × 168 = 336 MHz VCO output, which must
+land in 192–432 MHz. `PLLP = /4` (encoded `01`) → 336 / 4 = **84 MHz** SYSCLK.
+`PLLQ = 7` → 48 MHz, unused (no USB / SDIO / RNG) but set to a real valid value rather
+than a reserved encoding. `PLLSRC` left 0 = HSI; this board has never had an HSE.
+
+**Voltage scaling.** `PWR_CR.VOS` = Scale 2 (§3.4.1: good to 84 MHz). It needs
+`RCC_APB1ENR.PWREN` set first, like any APB1 register, and it is also the reset
+default — but §5.1.3 says the regulator is forced to Scale 3 whenever the PLL is off,
+so the write only takes effect once `PLLON` is set, and no `VOSRDY` poll is needed
+because the value never actually transitions.
+
+**Bus prescalers** (`RCC_CFGR`). APB1 caps at 42 MHz (§6.2) → `PPRE1 = /2`. APB2 and
+AHB both reach 84 MHz → `PPRE2` and `HPRE` stay at `/1`. `PPRE1` and `SW` are written
+together, so APB1 is already dividing by 2 in the same cycle SYSCLK becomes 84 MHz —
+no window where APB1 briefly sees undivided 84 MHz.
+
+Every value was checked against the RM0368 PDF text, then cross-checked against the
+disassembled binary.
+
+**Rederived constants.**
+
+| Constant | 16 MHz | 84 MHz | Derivation |
+|---|---|---|---|
+| `USART2_BRR` | `0x8B` | `0x16D` | USARTDIV = 42e6 / (16 × 115200) = 22.7865 → nearest 1/16 is 22 + 13/16 → `(22 << 4) \| 0xD` |
+| `I2C1` `CR2` / `CCR` / `TRISE` | 16 / 80 / 17 | 42 / 210 / 43 | `FREQ` = PCLK1 MHz; `CCR` = PCLK1 / (2 × 100 kHz); `TRISE` = PCLK1 MHz + 1 |
+| SysTick `RVR` | 15999 | 83999 | 84e6 / 1000 − 1 |
+
+**Verification** — recompiled-and-assumed is not the same as checked:
+
+| Signal | Target | Measured | Note |
+|---|---|---|---|
+| BME280 sample cadence | 1.500 s | 1.494–1.495 s | a stale 16 MHz reload would show ~286 ms |
+| I2C1 SCL period | 10 µs | ~9.89 µs | triggered on SDA falling edge — I2C is ~1 ms of activity every 1.5 s, an untriggered capture mostly catches idle |
+| UART TX bit period | 8.69 µs | ~8.55 µs | against the real 22 + 13/16 `BRR` rounding, not the naive division |
+| SysTick period @ 84 MHz | 1000 µs | 984.8 µs | temporary PA5 toggle again, then reverted |
+
+### The drift, and what it isn't
+
+All three clock-derived signals — SysTick, I2C SCL, UART TX — measure **1.1–1.6% fast**
+after the switch, up from the ~0.455% on SysTick alone at 16 MHz.
+
+What's solid: PCLK1 and HCLK are exact integer divisions of the same SYSCLK (confirmed
+in the disassembly), so they cannot carry genuinely different trim error at one
+instant. A consistent shift across all three is upstream of any single peripheral —
+one cause, not three bugs.
+
+What isn't: the shift is **consistent with** the HSI (an on-die RC oscillator, not a
+crystal) drifting under the higher self-heating at 84 MHz — but that was never tested
+against the alternatives. The distinguishing experiment is a capture immediately after
+a cold power-on versus one after ~10 minutes running: growing drift points to thermal,
+a constant offset from the first second points elsewhere — PLL jitter, or the logic
+analyzer's own uncharacterized timebase (a cheap crystal, never itself measured
+against a reference). That experiment hasn't been run. And 1.1–1.6% sits *outside* the
+HSI's own ±1% spec, so an out-of-spec part is a third live possibility. Unresolved,
+and flagged in-code near `clock_init()` rather than buried in history.
+
+Fixed while here: two comments where the shipped value was right but the derivation
+shown wasn't — the milestone-6 SysTick note had the off-by-one *direction* backwards
+(a too-large reload makes the clock slow, not fast, since period = `RVR` + 1), and the
+`USART2_BRR` comment stated 22.8125 as the raw division when that is the post-rounding
+register value (true division 22.7865, which rounds to the same step).
+
+---
+
+## Milestone 8 — DMA for UART TX
+
+Milestone 3's transmit polls `TXE` before every byte — the CPU hand-carries each one.
+DMA moves the bytes from memory into `USART2_DR` on the peripheral's own request line;
+the CPU sets the transfer up once and takes one interrupt when all N are done. The claim
+to prove is that the wire sees exactly what it saw before.
+
+**The mapping is not a choice.** RM0368 Table 28 (DMA1 request mapping) fixes it in
+silicon: USART2_TX is **DMA1, Stream 6, Channel 4** — the only cell in the table for
+it. (USART2_RX would be Stream 5, same channel.) Pick the wrong stream and the
+peripheral's request line never reaches it; the transfer silently never starts. That
+is the single most common DMA bug and it looks like nothing at all.
+
+**`CHSEL` is the load-bearing field.** `CHSEL[2:0]` in `DMA1_S6CR` selects which of the
+8 request lines multiplexed onto Stream 6 is live. Channel 4 = `100`. Left at the reset
+`000`, Stream 6 listens to **SPI3_TX** instead — `DMAT` set or not, USART2's request is
+not routed in and nothing transmits. Worth knowing what the wrong value selects, not
+just that it is wrong.
+
+**Placement.** DMA1 is on **AHB1** (`RCC_AHB1ENR` bit 21), even though it only ever
+serves APB1 / APB2 peripherals. IRQ: **DMA1_Stream6 = IRQ 17** (RM0368 Table 38,
+position 17; confirmed against CMSIS `stm32f401xe.h`). 17 < 32, so NVIC enable goes to
+`ISER[0]` bit 17 — unlike USART2's IRQ 38, which needed `ISER[1]` (milestone 4).
+
+**Configuration sequence** — order matters more than anywhere prior:
+
+1. `RCC_AHB1ENR.DMA1EN`.
+2. Disable the stream (`EN` = 0 in `SxCR`) and **poll it back to 0**. Most of `SxCR` is
+   write-protected while `EN` = 1, and `EN` does not drop synchronously — an in-flight
+   AHB beat retires first. Writing config through that window silently does nothing.
+3. Clear Stream 6's flags in `DMA_HIFCR` (`CTCIF6` / `CHTIF6` / `CTEIF6` / `CDMEIF6` /
+   `CFEIF6`, bits 21 / 20 / 19 / 18 / 16). RM0368 §9.5.5 requires it before re-enabling;
+   a stale `TCIF6` from the previous transfer trips the completion handler the instant
+   the next one starts.
+4. `SxPAR` = `&USART2_DR` (`0x4000 4404`, fixed — `PINC` = 0), `SxM0AR` = source,
+   `SxNDTR` = byte count.
+5. `SxCR`: `CHSEL` = 4, `DIR` = `01` (memory-to-peripheral), `MINC` = 1, `PSIZE` /
+   `MSIZE` = `00` (byte), `TCIE` = 1, `EN` = 1 — `EN` in the same write, since every
+   other field is now in place.
+6. `USART2_CR3.DMAT` — the USART has to be told to emit DMA requests on `TXE`. Separate
+   from anything in the DMA controller, and the second-most-common omission. Set once,
+   in init.
+
+**What the completion flag means.** `dma_tx_busy` is set by `uart_write_dma()` and
+cleared in the TC handler. It means *"the DMA engine still owns the caller's buffer"* —
+**not** *"the last byte has left the pin."* `TCIF6` fires when the final byte is written
+into `DR`; up to two more character times of shifting follow. Buffer reuse is safe then;
+powering down the USART is not — that needs USART `TC`, the same `TXE`-vs-`BTF`
+distinction milestone 5's I2C teardown draws. `uart_write_dma()` also spins on
+`dma_tx_busy` at entry, so back-to-back calls are safe but per-buffer synchronous — a
+truly non-blocking version would return a status or hold a queue, unneeded for one
+boot-time caller (noted as a tradeoff in-code).
+
+No cache-coherency step is required: the F401 has no data cache (unlike the F407 / F7).
+The source string lives in `.rodata` in flash, which DMA1's memory port reaches
+(RM0368 §2.1.4) — only memory-to-memory transfers are DMA2-only. The polled
+`uart_putc` / `uart_puts` path is unchanged; it must not run concurrently with a DMA
+transfer (both write `DR`), but sequential hand-off is fine because `uart_putc` waits
+for `TXE`.
+
+### Verification
+
+The boot line `USART2 TX now on DMA1 stream 6 / channel 4\r\n` is sent once, over DMA.
+Everything after it — the polled `chip id:`, the sample loop — is itself proof the
+transfer completed: `while (uart_tx_busy())` only releases when `DMA1_Stream6_IRQHandler`
+clears the flag, and that handler only runs if IRQ 17's vector slot is right. A wrong
+`CHSEL` or a wrong vector entry hangs the board with no output at all.
+
+Captured at CN3-RX (PA2), decoded with `sigrok-cli`:
+
+| Check | Result |
+|---|---|
+| DMA line + polled BME280 output, same pin | both byte-exact, **zero frame errors** |
+| Bit period, DMA-sourced segments | 8.564–8.568 µs |
+| Bit period, polled segments | 8.565–8.567 µs |
+| Difference | ~3 ns — below the 41.7 ns sample period at 24 MHz |
+| Longest edge interval, either stream | 6 bit-times, no more |
+
+The two bit-period populations are **identical to within instrument resolution** —
+there is nothing to distinguish because there is nothing different. Same USART, same
+`BRR`, same PCLK1; only the master filling `DR` changed, and that does not touch the
+bit clock. The 8.566 µs is ~1.44% fast of the 8.690 µs programmed rate — the
+milestone-7 drift, not anything DMA introduced.
+
+The stronger result is the **absence** of inter-byte stretch. Every edge interval in
+the DMA-sourced line is a clean 1–6× multiple of the bit period, exactly like the
+polled stream — the DMA controller kept `DR` fed continuously and was never once late
+to a `TXE`. That rules out arbitration or bus-contention stalls, which is the thing
+that would actually differ between a CPU-driven and a DMA-driven transmit. Checking for
+what should be absent, not only confirming what should be present.
+
+### Incidental — the floating-pin boot byte
+
+The decode shows one junk byte immediately before the first real frame, every boot.
+Between reset and the `MODER` / `AFRL` write, PA2 is a floating input — the line rests
+wherever the pull-up and stray capacitance leave it, and the receiver decodes a
+spurious start bit off the transition when the USART finally drives the pin. Every UART
+on this board does it. It reads as a firmware bug to anyone who hasn't accounted for
+pin state before initialization.
+
+### Bench note — catching boot output
+
+`openocd`'s SWD `reset` perturbs the ST-LINK's USB composite device and drops the
+virtual COM port for ~1–2 s — long enough to lose everything the firmware prints in
+that window, including a one-shot startup banner. Steady-state VCP capture is fine. For
+boot output, use the analyzer on PA2 (a separate signal path) or the B2/NRST button
+rather than the `reset` command.
+
+---
+
 ## Verification approach
 
-The through-line across all five milestones: a correct-looking output is not evidence
+The through-line across all eight milestones: a correct-looking output is not evidence
 that the mechanism producing it is correct.
 
 - Confirming a value is right doesn't prove your code set it — **disable the code and
@@ -420,6 +656,11 @@ that the mechanism producing it is correct.
   survived.**
 - Confirming a value is plausible doesn't prove the pipeline works — **drive the input
   and confirm the output follows.**
+- Confirming a rederived constant recompiled cleanly doesn't prove the clock changed
+  under it — **re-measure every derived timing on hardware.**
+- Confirming a replacement path emits the right bytes doesn't prove it behaves like what
+  it replaced — **measure both on the wire, and check for what should be absent**, not
+  only what should be present.
 
 Each of those caught something, or would have if it had been wrong.
 
@@ -438,3 +679,13 @@ Each of those caught something, or would have if it had been wrong.
   *(It's also true before the measurement starts.)*
 - The sensor disagreed with expected pressure, so the compensation math is
   wrong. *(Wrong city's elevation.)*
+- Loading the SysTick reload value too high makes the clock run fast. *(It runs slow —
+  the period is `RVR + 1`, so a too-large reload lengthens every tick. The shipped
+  value was right; the comment explaining it wasn't.)*
+- The post-PLL timing drift is the HSI self-heating at 84 MHz. *(Consistent with it, but
+  never tested against PLL jitter or the analyzer's own uncharacterized timebase — and
+  1.1–1.6% is outside the HSI's rated ±1%. Still open, and the commit that first stated
+  it as resolved had to be walked back.)*
+- Which DMA stream carries a peripheral's requests is something you configure. *(It's
+  fixed in silicon — RM0368 Table 28. USART2_TX is DMA1 stream 6, channel 4, and
+  nothing else routes it.)*
