@@ -25,6 +25,7 @@
 #define USART2_DR    (*(volatile uint32_t *)(USART2_BASE + 0x04))
 #define USART2_BRR   (*(volatile uint32_t *)(USART2_BASE + 0x08))
 #define USART2_CR1   (*(volatile uint32_t *)(USART2_BASE + 0x0C))
+#define USART2_CR3   (*(volatile uint32_t *)(USART2_BASE + 0x14))
 
 #define USART_SR_TXE  (1U << 7)
 #define USART_SR_RXNE (1U << 5)
@@ -32,6 +33,42 @@
 #define USART_CR1_RXNEIE (1U << 5)
 #define USART_CR1_TE     (1U << 3)
 #define USART_CR1_RE     (1U << 2)
+#define USART_CR3_DMAT   (1U << 7)  /* RM0368 19.6.6: USART raises a DMA request on every TXE */
+
+/*
+ * DMA1 for USART2_TX. RM0368 Table 28 (DMA1 request mapping) fixes this in
+ * silicon: USART2_TX is Stream 6, Channel 4 -- the only cell in the table for
+ * it, no alternative stream. (USART2_RX would be Stream 5, same channel.)
+ *
+ * DMA1 base 0x4002 6000 (RM0368 9.5.11 / memory map). It sits on AHB1
+ * (RCC_AHB1ENR bit 21) despite only ever serving APB1/APB2 peripherals.
+ *
+ * Per-stream register block: RM0368 9.5.5-9.5.8 place SxCR/SxNDTR/SxPAR/SxM0AR
+ * at 0x10/0x14/0x18/0x1C + 0x18 * stream. Stream 6 -> + 0x90.
+ */
+#define DMA1_BASE     0x40026000UL
+#define DMA1_HISR     (*(volatile uint32_t *)(DMA1_BASE + 0x04))  /* high interrupt status,     streams 4-7 */
+#define DMA1_HIFCR    (*(volatile uint32_t *)(DMA1_BASE + 0x0C))  /* high interrupt flag clear, streams 4-7 */
+#define DMA1_S6CR     (*(volatile uint32_t *)(DMA1_BASE + 0xA0))
+#define DMA1_S6NDTR   (*(volatile uint32_t *)(DMA1_BASE + 0xA4))
+#define DMA1_S6PAR    (*(volatile uint32_t *)(DMA1_BASE + 0xA8))
+#define DMA1_S6M0AR   (*(volatile uint32_t *)(DMA1_BASE + 0xAC))
+
+/* DMA_SxCR fields (RM0368 9.5.5). Everything not named here is deliberately
+ * left 0: PL[1:0]=00 (low priority), PSIZE/MSIZE=00 (byte), PINC=0 (DR address
+ * fixed), CIRC=0, DBM=0, bursts=00 (single). */
+#define DMA_SxCR_CHSEL_CH4 (4U << 25)   /* CHSEL[2:0]=100: channel 4 -> USART2_TX on stream 6 */
+#define DMA_SxCR_MINC      (1U << 10)   /* memory pointer walks forward */
+#define DMA_SxCR_DIR_M2P   (1U << 6)    /* DIR[1:0]=01: memory-to-peripheral */
+#define DMA_SxCR_TCIE      (1U << 4)    /* transfer-complete interrupt enable */
+#define DMA_SxCR_EN        (1U << 0)
+
+/* Stream 6's flags in DMA_HISR / matching clear bits in DMA_HIFCR (RM0368
+ * 9.5.2 / 9.5.4): TCIF6/HTIF6/TEIF6/DMEIF6/FEIF6 at bits 21/20/19/18/16
+ * (bit 17 reserved). Writing 1 to a CxxxIF6 bit in HIFCR clears the matching
+ * HISR flag. */
+#define DMA_HISR_TCIF6         (1U << 21)
+#define DMA_HIFCR_STREAM6_ALL  ((1U << 21) | (1U << 20) | (1U << 19) | (1U << 18) | (1U << 16))
 
 #define I2C1_BASE    0x40005400UL
 #define I2C1_CR1     (*(volatile uint32_t *)(I2C1_BASE + 0x00))
@@ -91,6 +128,13 @@
  * in ISER1, which covers IRQ32..63. Bit position = 38 - 32 = 6. */
 #define NVIC_ISER1      (*(volatile uint32_t *)0xE000E104UL)
 #define USART2_IRQn_BIT (1U << 6)
+
+/* NVIC: DMA1_Stream6 is IRQ17 (RM0368 Table 38 "Vector table", position 17;
+ * cross-checked against ST CMSIS stm32f401xe.h -> DMA1_Stream6_IRQn = 17).
+ * IRQ17 < 32, so it lands in ISER0 (IRQ0..31) at bit 17 -- unlike USART2's
+ * IRQ38 above, which needed ISER1. */
+#define NVIC_ISER0           (*(volatile uint32_t *)0xE000E100UL)
+#define DMA1_Stream6_IRQ_BIT (1U << 17)
 
 /* Clock tree: HSI (16 MHz) through the main PLL to 84 MHz SYSCLK, this
  * part's maximum (RM0368 6.3.1/6.3.2/6.3.3). Bit positions/values below
@@ -361,6 +405,113 @@ static void uart_put_hex_byte(uint8_t b)
 {
     uart_puts("0x");
     uart_put_hex_nibbles(b);
+}
+
+/*
+ * USART2 TX over DMA1 Stream 6, Channel 4 (RM0368 Table 28).
+ *
+ * uart_putc()/uart_puts() above are unchanged -- the synchronous path, still
+ * used for the short diagnostic strings in main(). This is the asynchronous
+ * path: hand uart_write_dma() a buffer, it returns immediately, and the bytes
+ * drain in the background off TXE-driven DMA requests. The two paths must not
+ * run *concurrently* on USART2 (both ultimately write USART2_DR, and their
+ * bytes would interleave); sequential hand-off is fine, since uart_putc()
+ * always waits for TXE before writing.
+ */
+
+/* Set by uart_write_dma(), cleared by DMA1_Stream6_IRQHandler on transfer
+ * complete. Its meaning is precisely "the DMA engine still owns the caller's
+ * buffer" -- NOT "the last byte has left the pin". TCIF6 fires when the final
+ * byte is written into USART2_DR; up to two more character times of shifting
+ * follow. Reusing the buffer at that point is safe; powering down or
+ * reconfiguring the USART is not (wait on USART TC for that -- the same
+ * TXE-vs-BTF distinction the I2C code draws when it closes a transaction).
+ * volatile for the same reason as the ring-buffer indices: the poll in
+ * uart_write_dma() must re-read RAM, not a register-cached copy. */
+static volatile uint8_t dma_tx_busy;
+
+static void uart_dma_init(void)
+{
+    RCC_AHB1ENR |= (1U << 21);   /* DMA1EN (RM0368 6.3.12); DMA1 is on AHB1 */
+    (void)RCC_AHB1ENR;
+
+    /* Tell USART2 to raise a DMA request on every TXE (RM0368 19.6.6). On its
+     * own this is invisible: with no enabled stream wired to USART2_TX's
+     * request line the requests go unanswered, and the polled uart_putc()
+     * path is unaffected. */
+    USART2_CR3 |= USART_CR3_DMAT;
+
+    NVIC_ISER0 = DMA1_Stream6_IRQ_BIT;
+}
+
+/* Begins a background transmit of len bytes from src and returns before it
+ * finishes. src must stay valid and unmodified until the transfer completes:
+ * spin on uart_tx_busy(), or just call this again (it blocks on the previous
+ * transfer first). src may live in flash or SRAM -- DMA1's memory port reaches
+ * both (RM0368 2.1.4). len 0 is a no-op; the ceiling is 65535 (NDT is 16-bit).
+ *
+ * API tradeoff: a single call is genuinely asynchronous, but the busy-wait
+ * below makes back-to-back calls synchronous -- the caller stalls for the
+ * previous transfer's duration. That is per-buffer polling in place of
+ * per-byte polling: better, not free. A truly non-blocking version would
+ * return a "still busy, try later" status and leave the decision to the
+ * caller, or hold a queue of pending buffers. Neither is needed yet -- the
+ * one caller here transmits once at boot -- so this keeps the simplest thing
+ * that is still correct about buffer ownership. */
+static void uart_write_dma(const void *src, uint16_t len)
+{
+    if (len == 0U) {
+        return;
+    }
+
+    while (dma_tx_busy) { }   /* the previous transfer still owns its buffer */
+
+    /* RM0368 9.5.5 (EN bit description) + 9.3.17: clear EN, then poll it back
+     * to 0 before touching any other SxCR/SxNDTR/SxPAR/SxM0AR field. They are
+     * all write-protected while EN reads 1, and EN does not drop synchronously
+     * -- the current AHB beat retires first. Writing config through that
+     * window is the canonical "DMA silently does nothing" bug. From reset EN
+     * is already 0, so the first call falls straight through. */
+    DMA1_S6CR &= ~DMA_SxCR_EN;
+    while (DMA1_S6CR & DMA_SxCR_EN) { }
+
+    /* RM0368 9.5.5, note under the EN bit: the stream's event flags must be
+     * cleared before EN is set again, or a leftover TCIF6 from the previous
+     * transfer trips the handler the instant this one starts. */
+    DMA1_HIFCR = DMA_HIFCR_STREAM6_ALL;
+
+    DMA1_S6PAR  = (uint32_t)&USART2_DR;   /* = USART2_BASE + 0x04 = 0x4000 4404; fixed (PINC=0) */
+    DMA1_S6M0AR = (uint32_t)src;
+    DMA1_S6NDTR = len;
+
+    dma_tx_busy = 1U;
+
+    /* CHSEL is the field this milestone is about: stream 6 multiplexes eight
+     * request lines and only channel 4 is USART2_TX (RM0368 Table 28). Left at
+     * 0 the stream listens to SPI3_TX instead -- USART2's request never
+     * reaches it, DMAT or not, and nothing transmits. EN goes in the same
+     * write: every other field is in place, so there is nothing left to
+     * write-protect. */
+    DMA1_S6CR = DMA_SxCR_CHSEL_CH4 | DMA_SxCR_DIR_M2P | DMA_SxCR_MINC
+              | DMA_SxCR_TCIE | DMA_SxCR_EN;
+}
+
+static uint8_t uart_tx_busy(void)
+{
+    return dma_tx_busy;
+}
+
+void DMA1_Stream6_IRQHandler(void)
+{
+    /* TCIE is the only source armed, but gate on the flag anyway so a spurious
+     * entry can't drop dma_tx_busy early. Hardware has already cleared EN at
+     * end of transfer (RM0368 9.5.5); uart_write_dma() clears it again before
+     * the next config pass. Clear TCIF6 before returning or the NVIC line
+     * re-asserts the moment this returns. */
+    if (DMA1_HISR & DMA_HISR_TCIF6) {
+        DMA1_HIFCR = DMA_HIFCR_STREAM6_ALL;
+        dma_tx_busy = 0U;
+    }
 }
 
 /*
@@ -814,6 +965,19 @@ int main(void)
     USART2_CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
 
     NVIC_ISER1 = USART2_IRQn_BIT;
+
+    uart_dma_init();
+
+    /* This line leaves over DMA1 / Stream 6 / Channel 4, not the uart_putc()
+     * poll loop. Wrong CHSEL, wrong stream, or a missing DMAT and it simply
+     * would not appear -- there is no partial-failure mode. The source is a
+     * .rodata string in flash, exercising DMA1's memory-port path to flash
+     * (RM0368 2.1.4). Analyzer-verified on CN3-RX: same 8.57 us bit period as
+     * the polled path, gap-free byte packing, no frame errors. */
+    static const char dma_banner[] =
+        "USART2 TX now on DMA1 stream 6 / channel 4\r\n";
+    uart_write_dma(dma_banner, (uint16_t)(sizeof(dma_banner) - 1U));
+    while (uart_tx_busy()) { }
 
     i2c1_init();
 

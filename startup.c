@@ -23,6 +23,7 @@ void PendSV_Handler(void)     __attribute__((weak, alias("Default_Handler")));
 void SysTick_Handler(void)    __attribute__((weak, alias("Default_Handler")));
 
 extern void USART2_IRQHandler(void);
+extern void DMA1_Stream6_IRQHandler(void);
 
 __attribute__((section(".isr_vector")))
 void (* const vector_table[])(void) =
@@ -43,11 +44,12 @@ void (* const vector_table[])(void) =
     0,
     PendSV_Handler,
     SysTick_Handler,
-    /* IRQ0..IRQ37: not used by this firmware yet */
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
+    /* IRQ0..IRQ37: slots filled as milestones need them (RM0368 Table 38). */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                  /* IRQ0..IRQ9   */
+    0, 0, 0, 0, 0, 0, 0, DMA1_Stream6_IRQHandler,  /* IRQ10..IRQ17 (17 = DMA1_Stream6) */
+    0, 0,                                          /* IRQ18..IRQ19 */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                  /* IRQ20..IRQ29 */
+    0, 0, 0, 0, 0, 0, 0, 0,                        /* IRQ30..IRQ37 */
     USART2_IRQHandler,  /* IRQ38 */
 };
 
